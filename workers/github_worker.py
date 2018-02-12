@@ -1,11 +1,12 @@
 import aiohttp
 import asyncio
 import random
+from lib.data_worker import DataWorker
 
 HEADERS = {
 	'Accept': 'application/vnd.github.v3+json',
 	'User-Agent': 'saninstein',
-	'Authorization': 'token f6b40664ab901755208db6352f7490cc0b7d86da'
+	'Authorization': 'token 5a2ad16f27d4ae114e96b96ab31142175ac0d8d1'
 }
 
 BASE_URL = 'https://api.github.com/{}'
@@ -17,7 +18,9 @@ class types:
 	REP = 3
 
 
-class GitStats:
+class GitStats(DataWorker):
+
+	update_frequency = 60 * 10
 
 	def __init__(
 		self,
@@ -26,9 +29,17 @@ class GitStats:
 
 		self.loop = loop
 		self.links = links
-		self.loop.run_until_complete(self.run())
 
-	async def run(self):
+	def fetch_data(self):
+		self.loop.run_until_complete(self._run())
+		self.save(1, self.info)
+
+	def save(self, coin_id, data):
+		if data is None:
+			return
+		print(data)
+
+	async def _run(self):
 		info = {
 			'people': set(),
 			'stars': 0,
@@ -73,7 +84,7 @@ class GitStats:
 				info['branches'] += x['branches']
 				info['issues']['open'] += x['issues']['open'] 
 				info['issues']['closed'] += x['issues']['closed']
-				
+
 				if x['last_commit'] is not None:
 					_time.append(x['last_commit'])
 
@@ -159,12 +170,4 @@ class GitStats:
 			val = val.split('/')
 			return (types.REP, val[0], val[1])
 
-
-if __name__ == '__main__':
-	links = [
-		'https://github.com/hcmc-project',
-		'https://github.com/ksanderer/hcmc-job-application',
-		'https://github.com/ksanderer'
-	]
-
-	print(GitStats(links).info)
+	
