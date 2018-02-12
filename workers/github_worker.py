@@ -6,7 +6,7 @@ from lib.data_worker import DataWorker
 HEADERS = {
 	'Accept': 'application/vnd.github.v3+json',
 	'User-Agent': 'saninstein',
-	'Authorization': 'token 5a2ad16f27d4ae114e96b96ab31142175ac0d8d1'
+	# 'Authorization': 'token 5a2ad16f27d4ae114e96b96ab31142175ac0d8d1'
 }
 
 BASE_URL = 'https://api.github.com/{}'
