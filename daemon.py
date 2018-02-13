@@ -1,14 +1,9 @@
 import time
 from workers.github_worker import GitStats
 
-links = [
-		'https://github.com/hcmc-project',
-		'https://github.com/ksanderer/hcmc-job-application',
-		'https://github.com/ksanderer'
-	]
 
 workers = [
-    GitStats(links),
+    GitStats(),
 ]
 
 for p in workers:
