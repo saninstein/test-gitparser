@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+import json
 import logging as log
 import random
 import time
@@ -14,6 +15,10 @@ ITEM_PATTERN = re.compile(r'github.com/([\w\.\-\_]+)/?([\w\.\-\_]+)?/?$')
 
 
 class RateLimitException(Exception):
+	pass
+
+
+class NotFoundException(Exception):
 	pass
 
 
@@ -32,9 +37,12 @@ class GitStats(DataWorker):
 	def __init__(self, loop=asyncio.get_event_loop()):
 		self.loop = loop
 		self.session = None
+		self.semaphore = asyncio.Semaphore(5)
 
 	def fetch_data(self):
+		t = time.time()
 		self.loop.run_until_complete(self._fetch_data())
+		print(time.time() - t)
 		self.loop.stop()
 		self.loop.close()
 
@@ -63,6 +71,8 @@ class GitStats(DataWorker):
 		for project in projects:
 			if not ('community' in project and 'github' in project['community']):
 				continue
+			if project['id'] > 20:
+				break
 
 			items = project['community']['github']
 			while True:
@@ -79,51 +89,52 @@ class GitStats(DataWorker):
 						'last_commit': None
 					}
 
-					async with asyncio.Semaphore(30):
-						repos = set()  # set of (owner, repository)
+					repos = set()  # set of (owner, repository)
 
-						for item in items:
-							_type, *val = await self.check_type(item)
-							if _type in (types.USR, types.ORG):  # item is not repository
-								user = val[0]
-								_repos = await self.get_account_repos(user)
-								for rep in _repos:
-									repos.add((user, rep))
+					for item in items:
+						_type, *val = await self.check_type(item)
+						if _type in (types.USR, types.ORG):  # item is not repository
+							user = val[0]
+							_repos = await self.get_account_repos(user)
+							for rep in _repos:
+								repos.add((user, rep))
 
-								if _type == types.ORG:
-									info['people'] |= await self.get_org_people(user)
-							else:
-								repos.add(tuple(val))
+							if _type == types.ORG:
+								info['people'] |= await self.get_org_people(user)
+						else:
+							repos.add(tuple(val))
 
-						tasks = []
-						for rep in repos:
-							task = asyncio.ensure_future(self.get_rep_info(*rep))
-							tasks.append(task)
+					tasks = []
+					for rep in repos:
+						task = asyncio.ensure_future(self.get_rep_info(*rep))
+						tasks.append(task)
 
-						results = await asyncio.gather(*tasks)
+					results = await asyncio.gather(*tasks)
 
-						last_commit_time = []
+					last_commit_time = []
 
-						# aggregate data
-						for x in results:
-							info['people'] |= x['people']
-							info['stars'] += x['stars']
-							info['commits'] += x['commits']
-							info['branches'] += x['branches']
-							info['issues']['open'] += x['issues']['open']
-							info['issues']['closed'] += x['issues']['closed']
+					# aggregate data
+					for x in results:
+						info['people'] |= x['people']
+						info['stars'] += x['stars']
+						info['commits'] += x['commits']
+						info['branches'] += x['branches']
+						info['issues']['open'] += x['issues']['open']
+						info['issues']['closed'] += x['issues']['closed']
 
-							if x['last_commit'] is not None:
-								last_commit_time.append(x['last_commit'])
+						if x['last_commit'] is not None:
+							last_commit_time.append(x['last_commit'])
 
-						info['last_commit'] = max(last_commit_time) if last_commit_time else 0  # get latest commit timestamp
-						info['sum_people'] = len(info['people'])
+					info['last_commit'] = max(last_commit_time) if last_commit_time else 0  # get latest commit timestamp
+					info['sum_people'] = len(info['people'])
 
-						info.pop('people', None)
-						self.save(project['id'], info)
+					if not info['sum_people']:  # if no people block and commits
+						info['sum_people'] = len({rep[0] for rep in repos})
+					info.pop('people', None)
+					self.save(project['id'], info)
 
-						await self.close_session()
-						break
+					await self.close_session()
+					break
 
 				except RateLimitException as e:
 					# choose active token
@@ -148,9 +159,9 @@ class GitStats(DataWorker):
 					else:
 						self.token = token_max_remainig[0]
 
-				# except Exception as e:
-				# 	log.error(f"id {project['id']}: {e}")
-				# 	break
+				except NotFoundException as e:
+					log.error(f"id {project['id']}: {e}")
+					break
 
 	async def close_session(self):
 		if self.session:
@@ -172,20 +183,21 @@ class GitStats(DataWorker):
 		if self.session is None:
 			self.session = aiohttp.ClientSession(headers=self.headers)
 
-		async with self.session.get(url) as res:
-			log.debug(f"{url}: [{res.status}]")
-			json = await res.json()
+		async with self.semaphore:
+			async with self.session.get(url) as res:
+				log.debug(f"{url}: [{res.status}]")
+				json = await res.json()
 
-			if url.startswith(BASE_URL[:-2]):  # request to git api
-				if res.status in (401, 403):
-					if res.status == 401:
-						log.info(f'Token {self.token} is invalid')
-						self.tokens.pop(self.token)
-					raise RateLimitException(res['message'])
+				if url.startswith(BASE_URL[:-2]):  # request to git api
+					if res.status in (401, 403):  # 403 - rate limit exceeded, 401 - Bad credentials  
+						if res.status == 401:
+							log.info(f'Token {self.token} is invalid')
+							self.tokens.pop(self.token)
+						raise RateLimitException(res['message'])
 
-				if res.status == 404:
-					raise Exception(res['message'])
-			return json, res
+					if res.status == 404:
+						raise NotFoundException(res['message'])
+				return json, res
 
 	async def get_rate_limit(self):
 		""" returns reamainig request and token update time  """
