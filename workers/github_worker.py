@@ -32,18 +32,15 @@ class GitStats(DataWorker):
 	def __init__(self, loop=asyncio.get_event_loop()):
 		self.loop = loop
 		self.session = None
-		self.count = 0
 
 	def fetch_data(self):
 		self.loop.run_until_complete(self._fetch_data())
 		self.loop.stop()
 		self.loop.close()
-		print(self.count)
 
 	def save(self, coin_id, data):
 		if data is None:
 			return
-		self.count += 1
 		print(coin_id, data)
 
 	async def _fetch_data(self):
