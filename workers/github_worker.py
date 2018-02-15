@@ -1,25 +1,21 @@
 import aiohttp
 import asyncio
-import json
 import logging as log
-import random
 import time
 import re
+from . import helpers
+from .exceptions import *
 from lib.data_worker import DataWorker
 
 
 log.basicConfig(format = u'%(filename)s[LINE:%(lineno)d] %(levelname)-8s [%(asctime)s] %(message)s', level = log.INFO)
 
 BASE_URL = 'https://api.github.com/{}'
+TOKENS_URL = 'http://saninstein.pythonanywhere.com/static/tokens.json'
+PROJECTS_URL = 'http://db.xyz.hcmc.io/data/coins.json'
+
+
 ITEM_PATTERN = re.compile(r'github.com/([\w\.\-\_]+)/?([\w\.\-\_]+)?/?$')
-
-
-class RateLimitException(Exception):
-	pass
-
-
-class NotFoundException(Exception):
-	pass
 
 
 class types:
@@ -38,13 +34,16 @@ class GitStats(DataWorker):
 		self.loop = loop
 		self.session = None
 		self.semaphore = asyncio.Semaphore(5)
+		self.removed_tokens = []
+
+		self.headers = {
+			'Accept': 'application/vnd.github.v3+json',
+			'User-Agent': 'saninstein',
+			'content-type': 'application/json'
+		}
 
 	def fetch_data(self):
-		t = time.time()
 		self.loop.run_until_complete(self._fetch_data())
-		print(time.time() - t)
-		self.loop.stop()
-		self.loop.close()
 
 	def save(self, coin_id, data):
 		if data is None:
@@ -53,32 +52,18 @@ class GitStats(DataWorker):
 
 	async def _fetch_data(self):
 
-		self.headers = self.headers = {
-			'Accept': 'application/vnd.github.v3+json',
-			'User-Agent': 'saninstein',
-			'content-type': 'application/json'
-		}
-
-		projects, _ = await self.fetch('http://db.xyz.hcmc.io/data/coins.json', True)
-		self.tokens, _ = await self.fetch('http://saninstein.pythonanywhere.com/static/tokens.json', True)
-
-		await self.close_session()
-
-		self.headers['Authorization'] = ''
-
-		self.token = self.tokens[0]
+		projects, _ = await self.fetch(PROJECTS_URL)
+		await self.set_token()
 
 		for project in projects:
 			if not ('community' in project and 'github' in project['community']):
 				continue
-			if project['id'] > 20:
-				break
 
 			items = project['community']['github']
 			while True:
 				try:
 					info = {
-						'people': set(),
+						'sum_people': 0,
 						'stars': 0,
 						'commits': 0,
 						'issues': {
@@ -86,13 +71,19 @@ class GitStats(DataWorker):
 							'closed': 0
 						},
 						'branches': 0,
-						'last_commit': None
+						'last_commit': None,
+						'commits_30d': 0
 					}
 
+					errors = []
 					repos = set()  # set of (owner, repository)
-
+					people = set()
 					for item in items:
-						_type, *val = await self.check_type(item)
+						try:
+							_type, *val = await self.check_type(item)
+						except NotFoundException:
+							errors.append((item, 'Not Found'))
+							continue
 						if _type in (types.USR, types.ORG):  # item is not repository
 							user = val[0]
 							_repos = await self.get_account_repos(user)
@@ -100,75 +91,87 @@ class GitStats(DataWorker):
 								repos.add((user, rep))
 
 							if _type == types.ORG:
-								info['people'] |= await self.get_org_people(user)
+								people |= await self.get_org_people(user)
 						else:
+							user = val[0]
 							repos.add(tuple(val))
+						people.add(user)
 
-					tasks = []
-					for rep in repos:
-						task = asyncio.ensure_future(self.get_rep_info(*rep))
-						tasks.append(task)
+					results = await self.fetch_repos_data(repos)
 
-					results = await asyncio.gather(*tasks)
-
-					last_commit_time = []
-
+					commits = set()  # (sha, date)
 					# aggregate data
 					for x in results:
-						info['people'] |= x['people']
+						people |= x['people']
 						info['stars'] += x['stars']
-						info['commits'] += x['commits']
+						commits |= x['commits']
 						info['branches'] += x['branches']
 						info['issues']['open'] += x['issues']['open']
 						info['issues']['closed'] += x['issues']['closed']
 
-						if x['last_commit'] is not None:
-							last_commit_time.append(x['last_commit'])
+					info['commits'] = len(commits)
+					info['sum_people'] = len(people)
 
-					info['last_commit'] = max(last_commit_time) if last_commit_time else 0  # get latest commit timestamp
-					info['sum_people'] = len(info['people'])
+					ts = helpers.sorted_commits_timestamp(commits)
+					filter_ts = helpers.get_ts_30days_ago()
+					info['last_commit'] = ts[0] if ts else None
+					info['commits_30d'] = len([1 for x in ts if x >= filter_ts])
 
-					if not info['sum_people']:  # if no people block and commits
-						info['sum_people'] = len({rep[0] for rep in repos})
-					info.pop('people', None)
+					if errors:
+						info['errors'] = errors
+
 					self.save(project['id'], info)
 
 					await self.close_session()
 					break
 
 				except RateLimitException as e:
-					# choose active token
-					tokens_info = []
-					for token in self.tokens:
-						await self.close_session()
-						self.token = token
-						token_remaining, token_reset = await self.get_rate_limit()
-						tokens_info.append((token, token_remaining, token_reset))
+					await self.set_token()
 
-					await self.close_session()
-
-					token_max_remainig = max(tokens_info, key=lambda x: x[1]) # choose token with max remaining
-
-					if not token_max_remainig[1] > 10:
-						# choose token with min reset time
-						token_min_reset_time = min(tokens_info, key=lambda x: x[2])
-						self.token = token_min_reset_time[0]
-						sleep_time = abs(time.time() - token_min_reset_time[2]) + 5
-						log.info(f'Info: Worker awaits {sleep_time} seconds')
-						await asyncio.sleep(sleep_time)
-					else:
-						self.token = token_max_remainig[0]
-
-				except NotFoundException as e:
-					log.error(f"id {project['id']}: {e}")
-					break
+	async def fetch_repos_data(self, repos):
+		tasks = []
+		for rep in repos:
+			task = asyncio.ensure_future(self.get_rep_info(*rep))
+			tasks.append(task)
+		return await asyncio.gather(*tasks)
 
 	async def close_session(self):
 		if self.session:
 			await self.session.close()
 			self.session = None
 
-	async def fetch(self, url, safe=False):
+	async def set_token(self):
+		self.tokens, _ = await self.fetch(TOKENS_URL)
+		self.tokens = [x for x in self.tokens if x not in self.removed_tokens]
+
+		if not self.tokens:
+			raise ValueError("No valid tokens")
+
+		tokens_info = []
+		for token in self.tokens:  # fetch tokens info
+			self.token = token
+			try:
+				token_remaining, token_reset = await self.get_rate_limit()
+				tokens_info.append((token, token_remaining, token_reset))
+			except BadCredentials as e:
+				log.info(f'Token {self.token} is invalid')
+				await self.remove_token()
+
+		# choose token with max remaining
+		token_max_remainig = max(tokens_info, key=lambda x: x[1])
+
+		if not token_max_remainig[1] > 10:
+			# choose token with min reset time
+			token_min_reset_time = min(tokens_info, key=lambda x: x[2])
+			self.token = token_min_reset_time[0]
+			sleep_time = abs(time.time() - token_min_reset_time[2]) + 5
+			log.info(f'Info: Worker awaits {sleep_time} seconds')
+			await asyncio.sleep(sleep_time)
+		else:
+			self.token = token_max_remainig[0]
+		await self.get_rate_limit()
+
+	async def fetch(self, url, update_auth=False):
 		""" fetch data from url
 			Args:
 				url: URL,
@@ -177,8 +180,9 @@ class GitStats(DataWorker):
 			Returns:
 				tuple of json data and response
 		"""
-		if 'Authorization' in self.headers:
+		if update_auth:
 			self.headers['Authorization'] = f'token {self.token}'
+			await self.close_session()
 
 		if self.session is None:
 			self.session = aiohttp.ClientSession(headers=self.headers)
@@ -189,15 +193,19 @@ class GitStats(DataWorker):
 				json = await res.json()
 
 				if url.startswith(BASE_URL[:-2]):  # request to git api
-					if res.status in (401, 403):  # 403 - rate limit exceeded, 401 - Bad credentials  
-						if res.status == 401:
-							log.info(f'Token {self.token} is invalid')
-							self.tokens.pop(self.token)
-						raise RateLimitException(res['message'])
-
+					if res.status == 401:
+						raise BadCredentials()
+					if res.status == 403:
+						raise RateLimitException(json['message'])
 					if res.status == 404:
-						raise NotFoundException(res['message'])
+						raise NotFoundException(json['message'])
 				return json, res
+
+	async def remove_token(self):
+		self.tokens.remove(self.token)
+		self.removed_tokens.append(self.token)
+		self.token = None
+		await self.close_session()
 
 	async def get_rate_limit(self):
 		""" returns reamainig request and token update time  """
@@ -206,84 +214,76 @@ class GitStats(DataWorker):
 		return rate_info['remaining'], rate_info['reset']
 
 	async def get_rep_info(self, owner, rep):
-		""" returns information of repository 
+		""" returns information of repository
 
 			Args:
 				owner: name of the repository owner
 				rep: repository name
 			Returns:
-				dict: {
-					'stars': int,
-					'people': set() - names of contributors,
-					'commits': int,
-					'issues': {
-						'open': int,
-						'closed': int
-					},
-					'branches': int,
-					last_commit: str - latest commit timestamp, YYYY-MM-DDTHH:MM:SSZ
-				}
-
+				info
 		"""
-		info = dict()
+		info = {
+			'stars': 0,
+			'people': set(),
+			'commits': set(),  # (sha, date)
+			'issues': {
+				'open': 0,
+				'closed': 0
+			},
+			'branches': 0
+		}
 		url = f'repos/{owner}/{rep}'
 
 		# stars
 		resp_rep, _ = await self.fetch(BASE_URL.format(url))
 		info['stars'] = resp_rep['stargazers_count']
 
-		# contributors
-		if resp_rep['size']:
-			resp_contr, _ = await self.fetch(BASE_URL.format(url + '/stats/contributors'))
-			info['people'] = {x['author']['login'] for x in resp_contr}
-		else:
-			info['people'] = set()
+		# branches
+		resp_branch, resp = await self.fetch(BASE_URL.format(url + '/branches'))
+		branches = [x['name'] for x in resp_branch]
+		info['branches'] = len(resp_branch)
 
+		# fork check
 		if resp_rep['fork']:
 			commit_url = url + f"/commits?since={resp_rep['created_at']}"
 		else:
 			commit_url = url + '/commits?'
 
 		if resp_rep['size']:
-			info['commits'], info['last_commit'] = await self._stats_get(commit_url, True)
-		else:
-			info['commits'] = 0
-			info['last_commit'] = None
-		# issues
-		info['issues'] = dict()
-		info['issues']['open'] = await self._stats_get(url + '/issues?state=open&filter=all')
-		info['issues']['closed'] = await self._stats_get(url + '/issues?state=closed&filter=all')
+			# fetch and agregate data (sha of commit, author, commit date)
+			# from all brenches
 
-		# branches
-		resp_branch, resp = await self.fetch(BASE_URL.format(url + '/branches'))
-		info['branches'] = len(resp_branch)
+			COMMIT_URL = BASE_URL.format(commit_url) + '&sha={}&per_page=100'
+			for branch in branches:
+				commit_url = COMMIT_URL.format(branch)
+				while commit_url:
+					commits_part, resp = await self.fetch(commit_url)
+					for commit in commits_part:
+						sha = commit['sha']
+						date = commit['commit']['committer']['date']
+						if commit['committer']:
+							info['people'].add(commit['committer']['login'])
+						info['commits'].add((sha, date))
+					commit_url = helpers.get_nextpage_url(resp.headers)
+
+		# issues
+		info['issues']['open'] = await self.get_count_by_pagination(url + '/issues?state=open&filter=all')
+		info['issues']['closed'] = await self.get_count_by_pagination(url + '/issues?state=closed&filter=all')
+
 		return info
 
-	async def _stats_get(self, url, commit=False):
+	async def get_count_by_pagination(self, url):
 			"""
-				the same algorithm for getting the number
-				of commits and issues
-
 				&per_page=1 because response may contain 'link' header,
 				which include last page number. last page number == number of items
 			"""
-			url += f'&per_page=1'
+			url += '&per_page=1'
 			resp_json, resp = await self.fetch(BASE_URL.format(url))
 
-			if 'link' in resp.headers:
-				link = resp.headers['link']
-				last_page_url = link[link.rfind('<') + 1:link.rfind('>')]
-				*_, total_pages = last_page_url.split('=')
-				total_pages = int(total_pages)
-				res = total_pages
-			else:
+			res = helpers.get_lastpage_number(resp.headers)
+			if not res:
 				res = len(resp_json)
-
-			# get latest commit timestamp
-			if commit:
-				return res, resp_json[0]['commit']['author']['date'] if res else None
-			else:
-				return res
+			return res
 
 	async def get_org_people(self, org):
 		""" returns the list of user from block people of the organization """
@@ -317,14 +317,15 @@ class GitStats(DataWorker):
 			tuple:	first element - types.*,
 					second - user,
 					third - repos (if item is type.REP)
-
 		"""
 
 		user, rep = ITEM_PATTERN.findall(item)[0]
 		if rep:
+			await self.fetch(BASE_URL.format(f'repos/{user}/{rep}'))
 			return (types.REP, user, rep)
 		else:
 			account_type = await self.check_user_type(user)
 			return (account_type, user)
+
 
 	
